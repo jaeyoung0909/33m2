@@ -216,3 +216,74 @@ def resume_collection(conn: sqlite3.Connection) -> tuple[int, set[str]] | None:
         "SELECT province FROM collection_progress WHERE collected_id = ?", (cid,)
     ).fetchall()
     return cid, {r[0] for r in done}
+
+
+def collect_district(
+    conn: sqlite3.Connection, collected_id: int, district: dict
+) -> int:
+    """한 구의 모든 매물을 페이지네이션으로 수집. 저장된 총 매물 수 반환."""
+    bbox = make_bbox(district["lat"], district["lng"])
+    page = 1
+    total = 0
+
+    while True:
+        rooms, is_last = fetch_rooms_page(
+            sw_lat=bbox["swLat"],
+            sw_lng=bbox["swLng"],
+            ne_lat=bbox["neLat"],
+            ne_lng=bbox["neLng"],
+            page=page,
+        )
+        if rooms:
+            save_rooms(conn, collected_id, rooms)
+            total += len(rooms)
+
+        if is_last:
+            break
+        page += 1
+        time.sleep(DELAY_BETWEEN_PAGES)
+
+    mark_province_done(conn, collected_id, district["name"])
+    return total
+
+
+def collect_all(db_path: str = "data/rooms.db"):
+    """서울 전체 수집. 이어쓰기 지원."""
+    conn = init_db(db_path)
+
+    resumed = resume_collection(conn)
+    if resumed:
+        collected_id, done_provinces = resumed
+        print(f"이전 수집 이어서 진행 (id={collected_id}, 완료: {len(done_provinces)}개 구)")
+    else:
+        collected_id = start_collection(conn)
+        done_provinces = set()
+        print(f"새 수집 시작 (id={collected_id})")
+
+    districts = fetch_seoul_districts()
+    seoul_districts = [
+        d for d in districts if d.get("fullName", "").startswith("서울")
+    ]
+    print(f"서울 {len(seoul_districts)}개 구 수집 시작")
+
+    for i, district in enumerate(seoul_districts, 1):
+        name = district["name"]
+        if name in done_provinces:
+            print(f"  [{i}/{len(seoul_districts)}] {name} — 이미 완료, 건너뜀")
+            continue
+
+        print(f"  [{i}/{len(seoul_districts)}] {name} 수집 중...", end=" ", flush=True)
+        count = collect_district(conn, collected_id, district)
+        print(f"{count}개 매물")
+        time.sleep(DELAY_BETWEEN_DISTRICTS)
+
+    finish_collection(conn, collected_id)
+    total = conn.execute(
+        "SELECT COUNT(*) FROM rooms WHERE collected_id = ?", (collected_id,)
+    ).fetchone()[0]
+    print(f"\n수집 완료! 총 {total}개 매물 저장됨.")
+    conn.close()
+
+
+if __name__ == "__main__":
+    collect_all()

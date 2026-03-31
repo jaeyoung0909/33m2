@@ -274,3 +274,82 @@ def test_resume_collection_returns_none_when_all_complete(db_path):
     result = resume_collection(conn)
     assert result is None
     conn.close()
+
+
+def test_collect_district_saves_all_pages(db_path):
+    from collector import init_db, start_collection, collect_district
+
+    conn = init_db(db_path)
+    cid = start_collection(conn)
+
+    district = {"name": "강남구", "lat": 37.49794, "lng": 127.06293}
+
+    page1_rooms = [
+        {
+            "rid": i,
+            "roomName": f"방{i}",
+            "state": "서울특별시",
+            "province": "강남구",
+            "town": "역삼동",
+            "propertyType": "오피스텔",
+            "usingFee": 300000,
+            "mgmtFee": 50000,
+            "pyeongSize": 8,
+            "roomCnt": 1,
+            "bathroomCnt": 1,
+            "cookroomCnt": 1,
+            "sittingroomCnt": 0,
+            "isSuperHost": False,
+            "longtermDiscountPer": 0,
+            "earlyDiscountAmount": 0,
+            "isNew": False,
+            "lat": 37.5,
+            "lng": 127.0,
+            "addrLot": "",
+            "addrStreet": "",
+            "picMain": "",
+        }
+        for i in range(3)
+    ]
+    page2_rooms = [
+        {
+            "rid": 10,
+            "roomName": "방10",
+            "state": "서울특별시",
+            "province": "강남구",
+            "town": "삼성동",
+            "propertyType": "아파트",
+            "usingFee": 500000,
+            "mgmtFee": 100000,
+            "pyeongSize": 18,
+            "roomCnt": 2,
+            "bathroomCnt": 1,
+            "cookroomCnt": 1,
+            "sittingroomCnt": 1,
+            "isSuperHost": True,
+            "longtermDiscountPer": 10,
+            "earlyDiscountAmount": 0,
+            "isNew": False,
+            "lat": 37.51,
+            "lng": 127.05,
+            "addrLot": "",
+            "addrStreet": "",
+            "picMain": "",
+        }
+    ]
+
+    with patch(
+        "collector.fetch_rooms_page",
+        side_effect=[(page1_rooms, False), (page2_rooms, True)],
+    ), patch("collector.time.sleep"):
+        total = collect_district(conn, cid, district)
+
+    assert total == 4
+    count = conn.execute("SELECT COUNT(*) FROM rooms").fetchone()[0]
+    assert count == 4
+
+    done = conn.execute(
+        "SELECT province FROM collection_progress WHERE collected_id = ?", (cid,)
+    ).fetchone()
+    assert done[0] == "강남구"
+    conn.close()
