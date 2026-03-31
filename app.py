@@ -26,7 +26,7 @@ def load_rooms(db_path: str = DB_PATH, collection_id: int = None) -> pd.DataFram
     conn = sqlite3.connect(db_path)
     query = "SELECT * FROM rooms"
     params = ()
-    if collection_id:
+    if collection_id is not None:
         query += " WHERE collected_id = ?"
         params = (collection_id,)
     df = pd.read_sql_query(query, conn, params=params)
@@ -263,7 +263,7 @@ elif st.session_state.level == 3:
     ]
     display_df["슈퍼호스트"] = display_df["슈퍼호스트"].map({1: "✓", 0: "—"})
     display_df["장기할인(%)"] = display_df["장기할인(%)"].apply(
-        lambda x: f"{x}%" if x > 0 else "—"
+        lambda x: f"{x}%" if pd.notna(x) and x > 0 else "—"
     )
 
     st.dataframe(
