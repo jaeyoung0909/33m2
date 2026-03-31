@@ -75,3 +75,55 @@ def init_db(db_path: str) -> sqlite3.Connection:
     """)
     conn.commit()
     return conn
+
+
+def fetch_seoul_districts() -> list[dict]:
+    """서울 25개 구 좌표를 markers API에서 가져온다."""
+    params = {**SEOUL_BBOX, "zoomLevel": 12}
+    resp = requests.get(f"{BASE_URL}/map/markers", headers=HEADERS, params=params)
+    resp.raise_for_status()
+    data = resp.json()["data"]
+    return data["regionMarkers"]
+
+
+def make_bbox(lat: float, lng: float, delta: float = 0.02) -> dict:
+    """구 중심 좌표에서 bounding box를 생성."""
+    return {
+        "swLat": round(lat - delta, 5),
+        "swLng": round(lng - delta, 5),
+        "neLat": round(lat + delta, 5),
+        "neLng": round(lng + delta, 5),
+    }
+
+
+def fetch_rooms_page(
+    sw_lat: float,
+    sw_lng: float,
+    ne_lat: float,
+    ne_lng: float,
+    page: int,
+    size: int = PAGE_SIZE,
+) -> tuple[list[dict], bool]:
+    """매물 한 페이지를 가져온다. (rooms, is_last) 반환."""
+    params = {
+        "swLat": sw_lat,
+        "swLng": sw_lng,
+        "neLat": ne_lat,
+        "neLng": ne_lng,
+        "zoomLevel": 15,
+        "page": page,
+        "size": size,
+    }
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = requests.get(
+                f"{BASE_URL}/map/rooms", headers=HEADERS, params=params
+            )
+            resp.raise_for_status()
+            data = resp.json()["data"]
+            return data.get("content", []), data.get("last", True)
+        except (requests.exceptions.RequestException, KeyError) as e:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise
