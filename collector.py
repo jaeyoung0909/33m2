@@ -127,3 +127,92 @@ def fetch_rooms_page(
                 time.sleep(2 ** attempt)
                 continue
             raise
+
+
+def start_collection(conn: sqlite3.Connection) -> int:
+    """새 수집 세션을 시작하고 collection id를 반환."""
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        "INSERT INTO collections (collected_at, status) VALUES (?, 'in_progress')",
+        (now,),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def save_rooms(conn: sqlite3.Connection, collected_id: int, rooms: list[dict]) -> int:
+    """매물 목록을 DB에 저장. 중복은 무시. 저장된 수 반환."""
+    saved = 0
+    for r in rooms:
+        try:
+            conn.execute(
+                """INSERT OR IGNORE INTO rooms (
+                    rid, collected_id, room_name, state, province, town,
+                    property_type, using_fee, mgmt_fee, pyeong_size,
+                    room_cnt, bathroom_cnt, cookroom_cnt, sittingroom_cnt,
+                    is_super_host, longterm_discount_per, early_discount_amount,
+                    is_new, lat, lng, addr_lot, addr_street, pic_main
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    r["rid"],
+                    collected_id,
+                    r.get("roomName"),
+                    r.get("state"),
+                    r.get("province"),
+                    r.get("town"),
+                    r.get("propertyType"),
+                    r.get("usingFee"),
+                    r.get("mgmtFee"),
+                    r.get("pyeongSize"),
+                    r.get("roomCnt"),
+                    r.get("bathroomCnt"),
+                    r.get("cookroomCnt"),
+                    r.get("sittingroomCnt"),
+                    1 if r.get("isSuperHost") else 0,
+                    r.get("longtermDiscountPer"),
+                    r.get("earlyDiscountAmount"),
+                    1 if r.get("isNew") else 0,
+                    r.get("lat"),
+                    r.get("lng"),
+                    r.get("addrLot"),
+                    r.get("addrStreet"),
+                    r.get("picMain"),
+                ),
+            )
+            saved += 1
+        except sqlite3.IntegrityError:
+            pass
+    conn.commit()
+    return saved
+
+
+def mark_province_done(conn: sqlite3.Connection, collected_id: int, province: str):
+    """구 수집 완료를 기록."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT OR REPLACE INTO collection_progress (collected_id, province, completed_at) VALUES (?, ?, ?)",
+        (collected_id, province, now),
+    )
+    conn.commit()
+
+
+def finish_collection(conn: sqlite3.Connection, collected_id: int):
+    """수집 완료 상태로 변경."""
+    conn.execute(
+        "UPDATE collections SET status = 'completed' WHERE id = ?", (collected_id,)
+    )
+    conn.commit()
+
+
+def resume_collection(conn: sqlite3.Connection) -> tuple[int, set[str]] | None:
+    """미완료 수집 세션을 찾아 (collection_id, 완료된 구 set) 반환. 없으면 None."""
+    row = conn.execute(
+        "SELECT id FROM collections WHERE status = 'in_progress' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return None
+    cid = row[0]
+    done = conn.execute(
+        "SELECT province FROM collection_progress WHERE collected_id = ?", (cid,)
+    ).fetchall()
+    return cid, {r[0] for r in done}
