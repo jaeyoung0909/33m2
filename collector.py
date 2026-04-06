@@ -4,7 +4,7 @@
 import sqlite3
 import time
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 
@@ -16,7 +16,7 @@ HEADERS = {
     "Client-Language": "ko",
 }
 SEOUL_BBOX = {"swLat": 37.41, "swLng": 126.76, "neLat": 37.72, "neLng": 127.18}
-PAGE_SIZE = 50
+PAGE_SIZE = 100
 MAX_RETRIES = 3
 DELAY_BETWEEN_PAGES = 0.3
 DELAY_BETWEEN_DISTRICTS = 0.8
@@ -69,6 +69,14 @@ def init_db(db_path: str) -> sqlite3.Connection:
             FOREIGN KEY (collected_id) REFERENCES collections(id)
         );
 
+        CREATE TABLE IF NOT EXISTS booking_rates (
+            rid INTEGER NOT NULL,
+            collected_id INTEGER NOT NULL,
+            available_mid INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (rid, collected_id),
+            FOREIGN KEY (collected_id) REFERENCES collections(id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_rooms_province ON rooms(province);
         CREATE INDEX IF NOT EXISTS idx_rooms_town ON rooms(province, town);
         CREATE INDEX IF NOT EXISTS idx_rooms_type ON rooms(property_type);
@@ -103,6 +111,8 @@ def fetch_rooms_page(
     ne_lng: float,
     page: int,
     size: int = PAGE_SIZE,
+    start_date: str = None,
+    end_date: str = None,
 ) -> tuple[list[dict], bool]:
     """매물 한 페이지를 가져온다. (rooms, is_last) 반환."""
     params = {
@@ -114,6 +124,10 @@ def fetch_rooms_page(
         "page": page,
         "size": size,
     }
+    if start_date:
+        params["startDate"] = start_date
+    if end_date:
+        params["endDate"] = end_date
     for attempt in range(MAX_RETRIES):
         try:
             resp = requests.get(
@@ -127,6 +141,33 @@ def fetch_rooms_page(
                 time.sleep(2 ** attempt)
                 continue
             raise
+
+
+def fetch_all_rids(
+    bbox: dict,
+    start_date: str = None,
+    end_date: str = None,
+) -> set[int]:
+    """bbox 내 모든 매물 rid를 수집."""
+    rids = set()
+    page = 1
+    while True:
+        rooms, is_last = fetch_rooms_page(
+            sw_lat=bbox["swLat"],
+            sw_lng=bbox["swLng"],
+            ne_lat=bbox["neLat"],
+            ne_lng=bbox["neLng"],
+            page=page,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        for r in rooms:
+            rids.add(r["rid"])
+        if is_last:
+            break
+        page += 1
+        time.sleep(DELAY_BETWEEN_PAGES)
+    return rids
 
 
 def start_collection(conn: sqlite3.Connection) -> int:
@@ -184,6 +225,16 @@ def save_rooms(conn: sqlite3.Connection, collected_id: int, rooms: list[dict]) -
             pass
     conn.commit()
     return saved
+
+
+def save_booking_rates(conn: sqlite3.Connection, collected_id: int, all_rids: set[int], available_rids: set[int]):
+    """예약률 데이터 저장. available_mid=1이면 중기 예약 가능, 0이면 예약됨."""
+    for rid in all_rids:
+        conn.execute(
+            "INSERT OR IGNORE INTO booking_rates (rid, collected_id, available_mid) VALUES (?, ?, ?)",
+            (rid, collected_id, 1 if rid in available_rids else 0),
+        )
+    conn.commit()
 
 
 def mark_province_done(conn: sqlite3.Connection, collected_id: int, province: str):
@@ -248,40 +299,90 @@ def collect_district(
 
 
 def collect_all(db_path: str = "data/rooms.db"):
-    """서울 전체 수집. 이어쓰기 지원."""
+    """서울 전체 수집 (단일 bbox) + 중기 예약률."""
     conn = init_db(db_path)
 
+    # 이전 in_progress 수집이 있으면 완료 처리 (새로 시작)
     resumed = resume_collection(conn)
     if resumed:
-        collected_id, done_provinces = resumed
-        print(f"이전 수집 이어서 진행 (id={collected_id}, 완료: {len(done_provinces)}개 구)")
-    else:
-        collected_id = start_collection(conn)
-        done_provinces = set()
-        print(f"새 수집 시작 (id={collected_id})")
+        old_cid, _ = resumed
+        finish_collection(conn, old_cid)
+        print(f"이전 미완료 수집 (id={old_cid})을 완료 처리함")
 
-    districts = fetch_seoul_districts()
-    seoul_districts = [
-        d for d in districts if d.get("fullName", "").startswith("서울")
-    ]
-    print(f"서울 {len(seoul_districts)}개 구 수집 시작")
+    collected_id = start_collection(conn)
+    print(f"새 수집 시작 (id={collected_id})")
 
-    for i, district in enumerate(seoul_districts, 1):
-        name = district["name"]
-        if name in done_provinces:
-            print(f"  [{i}/{len(seoul_districts)}] {name} — 이미 완료, 건너뜀")
-            continue
+    # Phase 1: 서울 전체 bbox로 모든 매물 수집
+    print("\n[Phase 1] 서울 전체 매물 수집 (단일 bbox)...")
+    bbox = SEOUL_BBOX
+    page = 1
+    total = 0
+    while True:
+        rooms, is_last = fetch_rooms_page(
+            sw_lat=bbox["swLat"],
+            sw_lng=bbox["swLng"],
+            ne_lat=bbox["neLat"],
+            ne_lng=bbox["neLng"],
+            page=page,
+        )
+        if rooms:
+            # 서울 매물만 저장
+            seoul_rooms = [r for r in rooms if r.get("state", "").startswith("서울")]
+            save_rooms(conn, collected_id, seoul_rooms)
+            total += len(seoul_rooms)
 
-        print(f"  [{i}/{len(seoul_districts)}] {name} 수집 중...", end=" ", flush=True)
-        count = collect_district(conn, collected_id, district)
-        print(f"{count}개 매물")
-        time.sleep(DELAY_BETWEEN_DISTRICTS)
+        if page % 20 == 0:
+            print(f"  {page}페이지... ({total}개 저장)", flush=True)
+
+        if is_last:
+            break
+        page += 1
+        time.sleep(DELAY_BETWEEN_PAGES)
+
+    all_rids = set(
+        r[0] for r in conn.execute(
+            "SELECT rid FROM rooms WHERE collected_id = ?", (collected_id,)
+        ).fetchall()
+    )
+    print(f"  완료! 총 {total}개 매물 (서울), {page}페이지 순회")
+
+    # Phase 2: 중기 예약률 (2달 후 1주일 기간으로 조회)
+    mid_start = (datetime.now() + timedelta(days=60)).strftime("%Y-%m-%d")
+    mid_end = (datetime.now() + timedelta(days=67)).strftime("%Y-%m-%d")
+    print(f"\n[Phase 2] 중기 예약률 수집 ({mid_start} ~ {mid_end})...")
+
+    available_rids = set()
+    page = 1
+    while True:
+        rooms, is_last = fetch_rooms_page(
+            sw_lat=bbox["swLat"],
+            sw_lng=bbox["swLng"],
+            ne_lat=bbox["neLat"],
+            ne_lng=bbox["neLng"],
+            page=page,
+            start_date=mid_start,
+            end_date=mid_end,
+        )
+        for r in rooms:
+            if r.get("state", "").startswith("서울"):
+                available_rids.add(r["rid"])
+
+        if page % 20 == 0:
+            print(f"  {page}페이지... ({len(available_rids)}개 가용)", flush=True)
+
+        if is_last:
+            break
+        page += 1
+        time.sleep(DELAY_BETWEEN_PAGES)
+
+    save_booking_rates(conn, collected_id, all_rids, available_rids)
+
+    booked = len(all_rids - available_rids)
+    rate = booked / len(all_rids) * 100 if all_rids else 0
+    print(f"  완료! 가용: {len(available_rids)}개, 예약됨: {booked}개, 예약률: {rate:.1f}%")
 
     finish_collection(conn, collected_id)
-    total = conn.execute(
-        "SELECT COUNT(*) FROM rooms WHERE collected_id = ?", (collected_id,)
-    ).fetchone()[0]
-    print(f"\n수집 완료! 총 {total}개 매물 저장됨.")
+    print(f"\n수집 완료! (id={collected_id})")
     conn.close()
 
 

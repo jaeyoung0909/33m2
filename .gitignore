@@ -1,4 +1,4 @@
-data/
+data/*.log
 .superpowers/
 __pycache__/
 *.pyc
